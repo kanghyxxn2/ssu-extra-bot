@@ -13,6 +13,7 @@ from config import (
     SSU_PATH_BASE_URL,
     SSU_PATH_LOGIN_URL,
     SSU_PATH_INDEX_URL,
+    SSU_PATH_LIST_URL,
     SSU_ID,
     SSU_PASSWORD,
 )
@@ -31,8 +32,6 @@ _HEADERS = {
 _COMPETENCIES = ["창의", "융합", "공동체", "의사소통", "리더십", "글로벌"]
 _PER_PAGE = 10
 
-SSU_PATH_LIST_URL = "https://path.ssu.ac.kr/ptfol/imng/icmpNsbjtPgm/findIcmpNsbjtPgmList.do"
-
 
 class SsuScraper:
     def __init__(self):
@@ -43,13 +42,18 @@ class SsuScraper:
         self.path_browser = None
         self.path_context = None
         self.path_page = None
+        self._http_client: httpx.AsyncClient | None = None
 
     async def close(self):
         await self.client.aclose()
+        if self._http_client:
+            await self._http_client.aclose()
         if self.path_context:
             await self.path_context.close()
         if self.path_browser:
             await self.path_browser.close()
+        if self.path_page:
+            await self.path_page.close()
         if self.playwright:
             await self.playwright.stop()
 
@@ -59,7 +63,7 @@ class SsuScraper:
         programs.extend(await self._scrape_job_center())
 
         if SSU_ID and SSU_PASSWORD:
-            path_programs = await self._scrape_ssu_path_playwright()
+            path_programs = await self._scrape_ssu_path()
             programs.extend(path_programs)
 
         return programs
@@ -169,46 +173,36 @@ class SsuScraper:
             "detail_url": detail_url,
         }
 
-    async def _scrape_ssu_path_playwright(self) -> list[dict]:
+    async def _scrape_ssu_path(self) -> list[dict]:
         if not SSU_ID or not SSU_PASSWORD:
             return []
 
         try:
-            if not self.playwright:
-                self.playwright = await playwright.async_api.async_playwright().start()
-
-            if not self.path_browser:
-                self.path_browser = await self.playwright.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox"],
+            if not self._http_client:
+                self._http_client = httpx.AsyncClient(
+                    timeout=30.0, headers=_HEADERS, follow_redirects=True,
                 )
 
-            if not self.path_context:
-                self.path_context = await self.path_browser.new_context()
+            logger.info("Attempting SSU-PATH login via HTTP...")
+            session = await self._http_client.post(
+                SSU_PATH_LOGIN_URL,
+                data={
+                    "userId": SSU_ID,
+                    "userPwd": SSU_PASSWORD,
+                    "rtnUrl": SSU_PATH_INDEX_URL,
+                },
+                follow_redirects=True,
+            )
 
-            page = await self.path_context.new_page()
-            page.set_default_timeout(60000)
+            if "로그인에 실패했습니다" in session.text:
+                logger.error("SSU-PATH login failed via HTTP")
+                return []
 
-            await page.goto(SSU_PATH_BASE_URL, timeout=60000)
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            response = await self._http_client.get(SSU_PATH_LIST_URL)
+            response.raise_for_status()
 
-            await page.wait_for_selector("#userId", timeout=15000)
-            await page.fill("#userId", SSU_ID)
-            await page.fill("#userPwd", SSU_PASSWORD)
-
-            async with page.expect_response("**/comm/login/user/login.do", timeout=30000):
-                await page.evaluate("loginProc()")
-
-            await page.wait_for_url("**/index.do", timeout=10000)
-
-            await page.goto(SSU_PATH_LIST_URL, timeout=60000)
-            await page.wait_for_load_state("domcontentloaded", timeout=10000)
-
-            html = await page.content()
-            programs = self._parse_path_programs(html)
-
-            logger.info(f"SSU-PATH scraped: {len(programs)} programs")
-            return programs
+            logger.info(f"SSU-PATH HTTP response: {response.status_code}")
+            return self._parse_path_programs(response.text)
 
         except Exception as e:
             logger.error(f"Error scraping SSU-PATH: {e}")
@@ -231,7 +225,7 @@ class SsuScraper:
 
     def _extract_path_program(self, card: Tag) -> dict | None:
         cells = card.select("td")
-        if len(cells) < 3:
+        if len(cells) < 2:
             return None
 
         first_cell = cells[0]
@@ -248,7 +242,8 @@ class SsuScraper:
 
         description = ""
         if len(cells) > 2:
-            description = cells[2].get_text(strip=True)[:200]
+            desc_el = cells[2].select_one("div")
+            description = desc_el.get_text(strip=True)[:200] if desc_el else ""
 
         detail_url = ""
         if title_el:
