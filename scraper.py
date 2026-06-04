@@ -189,9 +189,25 @@ class SsuScraper:
             "rtnUrl": "",
         }
         try:
-            response = await self.path_client.post(SSU_PATH_LOGIN_URL, data=login_data)
+            response = await self.path_client.post(SSU_PATH_LOGIN_URL, data=login_data, follow_redirects=False)
             response.raise_for_status()
-            return "로그인에 실패했습니다" not in response.text
+
+            if response.status_code == 302:
+                for cookie in self.path_client.cookies.jar:
+                    logger.info(f"Cookie set: {cookie.name}")
+                return True
+
+            if "<title>로그인" in response.text or "로그인에 실패했습니다" in response.text:
+                logger.error("Login failed - still on login page")
+                return False
+
+            test_response = await self.path_client.get(SSU_PATH_INDEX_URL, follow_redirects=False)
+            if test_response.status_code == 302 and "login" in test_response.headers.get("location", ""):
+                logger.error("Index page redirected to login - session not valid")
+                return False
+
+            logger.info("SSU-PATH login successful")
+            return True
         except Exception as e:
             logger.error(f"SSU-PATH login error: {e}")
             return False
