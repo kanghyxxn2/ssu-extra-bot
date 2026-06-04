@@ -9,6 +9,11 @@ SCRAPE_INTERVAL_HOURS = int(os.getenv("SCRAPE_INTERVAL_HOURS", "6"))
 
 SSU_JOB_LIST_URL = "https://job.ssu.ac.kr/service/careerProgram/careerProgramList.do"
 SSU_JOB_DETAIL_URL = "https://job.ssu.ac.kr/service/careerProgram/careerProgramView.do"
+SSU_PATH_BASE_URL = "https://path.ssu.ac.kr"
+SSU_PATH_LOGIN_URL = "https://path.ssu.ac.kr/comm/login/user/login.do"
+SSU_PATH_INDEX_URL = "https://path.ssu.ac.kr/index.do"
+SSU_ID = os.getenv("SSU_ID", "")
+SSU_PASSWORD = os.getenv("SSU_PASSWORD", "")
 CATEGORIES = [
     "상담/멘토링/코칭",
     "공모전/경진대회",

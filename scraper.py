@@ -6,7 +6,14 @@ from datetime import datetime
 import httpx
 from bs4 import BeautifulSoup, Tag
 
-from config import SSU_JOB_LIST_URL
+from config import (
+    SSU_JOB_LIST_URL,
+    SSU_PATH_BASE_URL,
+    SSU_PATH_LOGIN_URL,
+    SSU_PATH_INDEX_URL,
+    SSU_ID,
+    SSU_PASSWORD,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,15 +35,30 @@ class SsuScraper:
         self.client = httpx.AsyncClient(
             timeout=30.0, headers=_HEADERS, follow_redirects=True,
         )
+        self.path_client: httpx.AsyncClient | None = None
+        self.path_logged_in = False
 
     async def close(self):
         await self.client.aclose()
+        if self.path_client:
+            await self.path_client.aclose()
 
     async def scrape_all(self) -> list[dict]:
         programs = []
+
+        programs.extend(await self._scrape_job_center())
+
+        if SSU_ID and SSU_PASSWORD:
+            path_programs = await self._scrape_ssu_path()
+            programs.extend(path_programs)
+
+        return programs
+
+    async def _scrape_job_center(self) -> list[dict]:
+        programs = []
         page = 1
         while True:
-            page_programs = await self._scrape_page(page)
+            page_programs = await self._scrape_job_page(page)
             if not page_programs:
                 break
             programs.extend(page_programs)
@@ -45,30 +67,31 @@ class SsuScraper:
             page += 1
         return programs
 
-    async def _scrape_page(self, page: int = 1) -> list[dict]:
+    async def _scrape_job_page(self, page: int = 1) -> list[dict]:
         data = {"currentPageNo": str(page), "year": str(datetime.now().year)}
         try:
             response = await self.client.post(SSU_JOB_LIST_URL, data=data)
             response.raise_for_status()
-            return self._parse_programs(response.text)
+            return self._parse_job_programs(response.text)
         except Exception as e:
-            logger.error(f"Error scraping page {page}: {e}")
+            logger.error(f"Error scraping job center page {page}: {e}")
             return []
 
-    def _parse_programs(self, html: str) -> list[dict]:
+    def _parse_job_programs(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
         cards = soup.select("div.desc_wrap")
         programs = []
         for card in cards:
             try:
-                program = self._extract_program(card)
+                program = self._extract_job_program(card)
                 if program and len(program.get("title", "")) > 5:
+                    program["source"] = "job_center"
                     programs.append(program)
             except Exception as e:
-                logger.warning(f"Failed to parse card: {e}")
+                logger.warning(f"Failed to parse job card: {e}")
         return programs
 
-    def _extract_program(self, card: Tag) -> dict | None:
+    def _extract_job_program(self, card: Tag) -> dict | None:
         title_el = card.select_one("a.detailBtn span.tit")
         title = title_el.get_text(strip=True) if title_el else ""
         if not title:
@@ -133,6 +156,94 @@ class SsuScraper:
             "edu_end": edu_end,
             "target": target,
             "competency": competency,
+            "detail_url": detail_url,
+        }
+
+    async def _scrape_ssu_path(self) -> list[dict]:
+        if not SSU_ID or not SSU_PASSWORD:
+            return []
+
+        try:
+            if not self.path_logged_in:
+                if not self.path_client:
+                    self.path_client = httpx.AsyncClient(
+                        timeout=30.0, headers=_HEADERS, follow_redirects=True,
+                    )
+                success = await self._login_ssu_path()
+                if not success:
+                    logger.error("SSU-PATH login failed")
+                    return []
+                self.path_logged_in = True
+
+            response = await self.path_client.get(SSU_PATH_INDEX_URL)
+            response.raise_for_status()
+            return self._parse_path_programs(response.text)
+        except Exception as e:
+            logger.error(f"Error scraping SSU-PATH: {e}")
+            return []
+
+    async def _login_ssu_path(self) -> bool:
+        login_data = {
+            "userId": SSU_ID,
+            "userPwd": SSU_PASSWORD,
+            "rtnUrl": "",
+        }
+        try:
+            response = await self.path_client.post(SSU_PATH_LOGIN_URL, data=login_data)
+            response.raise_for_status()
+            return "로그인에 실패했습니다" not in response.text
+        except Exception as e:
+            logger.error(f"SSU-PATH login error: {e}")
+            return False
+
+    def _parse_path_programs(self, html: str) -> list[dict]:
+        soup = BeautifulSoup(html, "lxml")
+        programs = []
+        cards = soup.select("div.program-item, div.card-item, ul.program-list li, tr.program-row")
+        for card in cards:
+            try:
+                program = self._extract_path_program(card)
+                if program and len(program.get("title", "")) > 5:
+                    program["source"] = "ssu_path"
+                    programs.append(program)
+            except Exception as e:
+                logger.warning(f"Failed to parse path card: {e}")
+        return programs
+
+    def _extract_path_program(self, card: Tag) -> dict | None:
+        title_el = card.select_one("a, .title, .program-title, h3, h4, td:first-child a")
+        title = title_el.get_text(strip=True) if title_el else ""
+        if not title or len(title) < 5:
+            return None
+
+        status_el = card.select_one(".status, .badge, .label, [class*='status']")
+        status = status_el.get_text(strip=True) if status_el else "모집중"
+
+        desc_el = card.select_one(".desc, .description, p, td:nth-child(2)")
+        description = desc_el.get_text(strip=True)[:200] if desc_el else ""
+
+        link_el = card.select_one("a[href*='View'], a[href*='detail']")
+        detail_url = ""
+        if link_el:
+            href = link_el.get("href", "")
+            if href.startswith("/"):
+                detail_url = f"{SSU_PATH_BASE_URL}{href}"
+            elif href.startswith("http"):
+                detail_url = href
+
+        text = card.get_text(separator=" ", strip=True)
+        dates = re.findall(r"\d{4}\.\d{2}\.\d{2}", text)
+        apply_start = dates[0] if dates else ""
+        apply_end = dates[1] if len(dates) > 1 else ""
+
+        return {
+            "title": title,
+            "status": status,
+            "department": "숭실대학교",
+            "program_type": "비교과",
+            "description": description,
+            "apply_start": apply_start,
+            "apply_end": apply_end,
             "detail_url": detail_url,
         }
 
