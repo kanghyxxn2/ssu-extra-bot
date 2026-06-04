@@ -4,6 +4,9 @@ builder = "NIXPACKS"
 [build.env]
 NIXPACKS_PLAYWRIGHT_BROWSERS = "chromium"
 
+[build.nixpacks]
+postInstall = "pip install playwright && playwright install chromium"
+
 [deploy]
 startCommand = "python main.py"
 restartPolicyType = "ON_FAILURE"
