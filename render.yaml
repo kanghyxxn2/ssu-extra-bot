@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: ssu-extra-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt && playwright install chromium --with-deps
+    startCommand: python main.py
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: SSU_ID
+        sync: false
+      - key: SSU_PASSWORD
+        sync: false
