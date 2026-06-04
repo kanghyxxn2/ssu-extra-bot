@@ -37,24 +37,12 @@ class SsuScraper:
         self.client = httpx.AsyncClient(
             timeout=30.0, headers=_HEADERS, follow_redirects=True,
         )
-        self.playwright: playwright.async_api.PlaywrightContext | None = None
-        self.path_browser = None
-        self.path_context = None
-        self.path_page = None
         self._http_client: httpx.AsyncClient | None = None
 
     async def close(self):
         await self.client.aclose()
         if self._http_client:
             await self._http_client.aclose()
-        if self.path_context:
-            await self.path_context.close()
-        if self.path_browser:
-            await self.path_browser.close()
-        if self.path_page:
-            await self.path_page.close()
-        if self.playwright:
-            await self.playwright.stop()
 
     async def scrape_all(self) -> list[dict]:
         programs = []
