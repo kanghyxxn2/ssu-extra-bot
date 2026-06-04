@@ -1,9 +1,11 @@
+import asyncio
 import json
 import logging
 import re
 from datetime import datetime
 
 import httpx
+import playwright.async_api
 from bs4 import BeautifulSoup, Tag
 
 from config import (
@@ -29,19 +31,27 @@ _HEADERS = {
 _COMPETENCIES = ["창의", "융합", "공동체", "의사소통", "리더십", "글로벌"]
 _PER_PAGE = 10
 
+SSU_PATH_LIST_URL = "https://path.ssu.ac.kr/ptfol/imng/icmpNsbjtPgm/findIcmpNsbjtPgmList.do"
+
 
 class SsuScraper:
     def __init__(self):
         self.client = httpx.AsyncClient(
             timeout=30.0, headers=_HEADERS, follow_redirects=True,
         )
-        self.path_client: httpx.AsyncClient | None = None
-        self.path_logged_in = False
+        self.playwright: playwright.async_api.PlaywrightContext | None = None
+        self.path_browser = None
+        self.path_context = None
+        self.path_page = None
 
     async def close(self):
         await self.client.aclose()
-        if self.path_client:
-            await self.path_client.aclose()
+        if self.path_context:
+            await self.path_context.close()
+        if self.path_browser:
+            await self.path_browser.close()
+        if self.playwright:
+            await self.playwright.stop()
 
     async def scrape_all(self) -> list[dict]:
         programs = []
@@ -49,7 +59,7 @@ class SsuScraper:
         programs.extend(await self._scrape_job_center())
 
         if SSU_ID and SSU_PASSWORD:
-            path_programs = await self._scrape_ssu_path()
+            path_programs = await self._scrape_ssu_path_playwright()
             programs.extend(path_programs)
 
         return programs
@@ -159,63 +169,52 @@ class SsuScraper:
             "detail_url": detail_url,
         }
 
-    async def _scrape_ssu_path(self) -> list[dict]:
+    async def _scrape_ssu_path_playwright(self) -> list[dict]:
         if not SSU_ID or not SSU_PASSWORD:
             return []
 
         try:
-            if not self.path_logged_in:
-                if not self.path_client:
-                    self.path_client = httpx.AsyncClient(
-                        timeout=30.0, headers=_HEADERS, follow_redirects=True,
-                    )
-                success = await self._login_ssu_path()
-                if not success:
-                    logger.error("SSU-PATH login failed")
-                    return []
-                self.path_logged_in = True
+            if not self.playwright:
+                self.playwright = await playwright.async_api.async_playwright().start()
 
-            response = await self.path_client.get(SSU_PATH_INDEX_URL)
-            response.raise_for_status()
-            return self._parse_path_programs(response.text)
+            if not self.path_browser:
+                self.path_browser = await self.playwright.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox"],
+                )
+
+            if not self.path_context:
+                self.path_context = await self.path_browser.new_context()
+
+            page = await self.path_context.new_page()
+            await page.goto(SSU_PATH_BASE_URL)
+
+            await page.fill("#userId", SSU_ID)
+            await page.fill("#userPwd", SSU_PASSWORD)
+
+            async with page.expect_response("**/comm/login/user/login.do", timeout=30000):
+                await page.evaluate("loginProc()")
+
+            await page.wait_for_url("**/index.do", timeout=10000)
+
+            await page.goto(SSU_PATH_LIST_URL, timeout=30000)
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+
+            html = await page.content()
+            programs = self._parse_path_programs(html)
+
+            logger.info(f"SSU-PATH scraped: {len(programs)} programs")
+            return programs
+
         except Exception as e:
             logger.error(f"Error scraping SSU-PATH: {e}")
             return []
 
-    async def _login_ssu_path(self) -> bool:
-        login_data = {
-            "userId": SSU_ID,
-            "userPwd": SSU_PASSWORD,
-            "rtnUrl": "",
-        }
-        try:
-            response = await self.path_client.post(SSU_PATH_LOGIN_URL, data=login_data, follow_redirects=False)
-            response.raise_for_status()
-
-            if response.status_code == 302:
-                for cookie in self.path_client.cookies.jar:
-                    logger.info(f"Cookie set: {cookie.name}")
-                return True
-
-            if "<title>로그인" in response.text or "로그인에 실패했습니다" in response.text:
-                logger.error("Login failed - still on login page")
-                return False
-
-            test_response = await self.path_client.get(SSU_PATH_INDEX_URL, follow_redirects=False)
-            if test_response.status_code == 302 and "login" in test_response.headers.get("location", ""):
-                logger.error("Index page redirected to login - session not valid")
-                return False
-
-            logger.info("SSU-PATH login successful")
-            return True
-        except Exception as e:
-            logger.error(f"SSU-PATH login error: {e}")
-            return False
-
     def _parse_path_programs(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
         programs = []
-        cards = soup.select("div.program-item, div.card-item, ul.program-list li, tr.program-row")
+
+        cards = soup.select("tr")
         for card in cards:
             try:
                 program = self._extract_path_program(card)
@@ -227,30 +226,42 @@ class SsuScraper:
         return programs
 
     def _extract_path_program(self, card: Tag) -> dict | None:
-        title_el = card.select_one("a, .title, .program-title, h3, h4, td:first-child a")
-        title = title_el.get_text(strip=True) if title_el else ""
+        cells = card.select("td")
+        if len(cells) < 3:
+            return None
+
+        first_cell = cells[0]
+        title_el = first_cell.select_one("a")
+        title = title_el.get_text(strip=True) if title_el else first_cell.get_text(strip=True)
+
         if not title or len(title) < 5:
             return None
 
-        status_el = card.select_one(".status, .badge, .label, [class*='status']")
-        status = status_el.get_text(strip=True) if status_el else "모집중"
+        status = "모집중"
+        if len(cells) > 1:
+            status_cell = cells[1]
+            status = status_cell.get_text(strip=True) or "모집중"
 
-        desc_el = card.select_one(".desc, .description, p, td:nth-child(2)")
-        description = desc_el.get_text(strip=True)[:200] if desc_el else ""
+        description = ""
+        if len(cells) > 2:
+            description = cells[2].get_text(strip=True)[:200]
 
-        link_el = card.select_one("a[href*='View'], a[href*='detail']")
         detail_url = ""
-        if link_el:
-            href = link_el.get("href", "")
+        if title_el:
+            href = title_el.get("href", "")
             if href.startswith("/"):
                 detail_url = f"{SSU_PATH_BASE_URL}{href}"
             elif href.startswith("http"):
                 detail_url = href
 
+        apply_start = ""
+        apply_end = ""
         text = card.get_text(separator=" ", strip=True)
         dates = re.findall(r"\d{4}\.\d{2}\.\d{2}", text)
-        apply_start = dates[0] if dates else ""
-        apply_end = dates[1] if len(dates) > 1 else ""
+        if len(dates) >= 1:
+            apply_start = dates[0]
+        if len(dates) >= 2:
+            apply_end = dates[1]
 
         return {
             "title": title,
