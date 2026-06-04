@@ -12,6 +12,7 @@ SSU_JOB_DETAIL_URL = "https://job.ssu.ac.kr/service/careerProgram/careerProgramV
 SSU_PATH_BASE_URL = "https://path.ssu.ac.kr"
 SSU_PATH_LOGIN_URL = "https://path.ssu.ac.kr/comm/login/user/login.do"
 SSU_PATH_INDEX_URL = "https://path.ssu.ac.kr/index.do"
+SSU_PATH_LIST_URL = "https://path.ssu.ac.kr/ptfol/imng/icmpNsbjtPgm/findIcmpNsbjtPgmList.do"
 SSU_ID = os.getenv("SSU_ID", "")
 SSU_PASSWORD = os.getenv("SSU_PASSWORD", "")
 CATEGORIES = [
