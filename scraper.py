@@ -187,8 +187,12 @@ class SsuScraper:
                 self.path_context = await self.path_browser.new_context()
 
             page = await self.path_context.new_page()
-            await page.goto(SSU_PATH_BASE_URL)
+            page.set_default_timeout(60000)
 
+            await page.goto(SSU_PATH_BASE_URL, timeout=60000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+
+            await page.wait_for_selector("#userId", timeout=15000)
             await page.fill("#userId", SSU_ID)
             await page.fill("#userPwd", SSU_PASSWORD)
 
@@ -197,7 +201,7 @@ class SsuScraper:
 
             await page.wait_for_url("**/index.do", timeout=10000)
 
-            await page.goto(SSU_PATH_LIST_URL, timeout=30000)
+            await page.goto(SSU_PATH_LIST_URL, timeout=60000)
             await page.wait_for_load_state("domcontentloaded", timeout=10000)
 
             html = await page.content()
