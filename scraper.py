@@ -167,28 +167,54 @@ class SsuScraper:
         try:
             if not self._http_client:
                 self._http_client = httpx.AsyncClient(
-                    timeout=30.0, headers=_HEADERS, follow_redirects=True,
+                    timeout=30.0, headers=_HEADERS, follow_redirects=False,
                 )
 
-            logger.info("Attempting SSU-PATH login via HTTP...")
-            session = await self._http_client.post(
+            logger.info("Getting SSU-PATH login page for cookies...")
+            login_page = await self._http_client.get(SSU_PATH_LOGIN_URL)
+            cookies = dict(login_page.cookies)
+
+            soup = BeautifulSoup(login_page.text, "lxml")
+            csrf_input = soup.select_one("input[name='CSRF_TOKEN']")
+            csrf_token = csrf_input.get("value", "") if csrf_input else ""
+
+            login_data = {
+                "userId": SSU_ID,
+                "userPwd": SSU_PASSWORD,
+                "rtnUrl": SSU_PATH_INDEX_URL,
+            }
+            if csrf_token:
+                login_data["CSRF_TOKEN"] = csrf_token
+
+            logger.info("Posting SSU-PATH login...")
+            login_response = await self._http_client.post(
                 SSU_PATH_LOGIN_URL,
-                data={
-                    "userId": SSU_ID,
-                    "userPwd": SSU_PASSWORD,
-                    "rtnUrl": SSU_PATH_INDEX_URL,
-                },
-                follow_redirects=True,
+                data=login_data,
+                cookies=cookies,
+                follow_redirects=False,
             )
 
-            if "로그인에 실패했습니다" in session.text:
-                logger.error("SSU-PATH login failed via HTTP")
+            if login_response.status_code in (302, 303):
+                logger.info("Login successful (redirect received)")
+                new_cookies = dict(login_response.cookies)
+                cookies.update(new_cookies)
+            elif "로그인에 실패했습니다" in login_response.text:
+                logger.error("SSU-PATH login failed: incorrect credentials")
+                return []
+            else:
+                logger.warning(f"Unexpected login response: {login_response.status_code}")
+
+            response = await self._http_client.get(SSU_PATH_LIST_URL, cookies=cookies)
+
+            if response.status_code == 302:
+                logger.warning("Still redirected to login - session not established")
+                redirect_url = response.headers.get("location", "")
+                logger.info(f"Redirected to: {redirect_url}")
                 return []
 
-            response = await self._http_client.get(SSU_PATH_LIST_URL)
             response.raise_for_status()
 
-            logger.info(f"SSU-PATH HTTP response: {response.status_code}")
+            logger.info(f"SSU-PATH list response: {response.status_code}")
             return self._parse_path_programs(response.text)
 
         except Exception as e:
