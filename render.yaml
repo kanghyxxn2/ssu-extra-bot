@@ -1,11 +1,8 @@
 services:
-  - type: worker
+  - type: web
     name: ssu-extra-bot
-    env: python
+    env: docker
     plan: free
-    buildCommand: pip install -r requirements.txt && playwright install chromium --with-deps
-    startCommand: python main.py
-    autoDeploy: true
     envVars:
       - key: DISCORD_BOT_TOKEN
         sync: false
@@ -13,3 +10,7 @@ services:
         sync: false
       - key: SSU_PASSWORD
         sync: false
+    dockerfilePath: ./Dockerfile
+    context: .
+    autoDeploy: true
+    healthCheckPath: /health
