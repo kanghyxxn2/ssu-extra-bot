@@ -1,0 +1,10 @@
+[phases.setup]
+nixPkgs = ["playwright", "chromium"]
+cmds = ["playwright install --with-deps chromium"]
+
+[phases.build]
+nixPkgs = ["python312"]
+cmds = ["python3 -m pip install -r requirements.txt"]
+
+[start]
+cmd = "python main.py"
