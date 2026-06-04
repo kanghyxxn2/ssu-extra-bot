@@ -5,7 +5,6 @@ import re
 from datetime import datetime
 
 import httpx
-import playwright.async_api
 from bs4 import BeautifulSoup, Tag
 
 from config import (
