@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS programs (
     capacity INTEGER DEFAULT 0,
     applicants INTEGER DEFAULT 0,
     status TEXT,
+    source TEXT,
+    source_key TEXT,
+    status_code TEXT,
     detail_url TEXT,
     hash TEXT UNIQUE NOT NULL,
     scraped_at TEXT NOT NULL,
@@ -33,6 +36,7 @@ CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER UNIQUE NOT NULL,
     username TEXT,
     notifications_enabled INTEGER DEFAULT 1,
+    onboarding_completed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -58,6 +62,12 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at TEXT NOT NULL,
     UNIQUE(user_id, program_id)
 );
+
+CREATE TABLE IF NOT EXISTS app_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -70,36 +80,80 @@ class Database:
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_SCHEMA)
+        await self._migrate_schema()
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.commit()
+
+    async def _migrate_schema(self):
+        cursor = await self._conn.execute("PRAGMA table_info(programs)")
+        program_columns = {row["name"] for row in await cursor.fetchall()}
+        for column, declaration in (
+            ("source", "TEXT"),
+            ("source_key", "TEXT"),
+            ("status_code", "TEXT"),
+        ):
+            if column not in program_columns:
+                await self._conn.execute(
+                    f"ALTER TABLE programs ADD COLUMN {column} {declaration}"
+                )
+
+        cursor = await self._conn.execute("PRAGMA table_info(users)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "onboarding_completed_at" not in columns:
+            now = datetime.now().isoformat()
+            await self._conn.execute(
+                "ALTER TABLE users ADD COLUMN onboarding_completed_at TEXT"
+            )
+            await self._conn.execute(
+                "UPDATE users SET onboarding_completed_at = ?", (now,)
+            )
 
     async def close(self):
         if self._conn:
             await self._conn.close()
 
-    async def upsert_program(self, program: dict) -> Optional[int]:
+    async def upsert_program(self, program: dict) -> bool:
         now = datetime.now().isoformat()
+        detail_url = program.get("detail_url", "")
+        source = program.get("source")
+        source_key = program.get("source_key")
+        status_code = program.get("status_code")
+        identity = (
+            f"{source}:{source_key}"
+            if source and source_key
+            else f"{program['title']}:{detail_url}"
+        )
         program_hash = hashlib.md5(
-            f"{program['title']}:{program.get('detail_url', '')}".encode()
+            identity.encode()
         ).hexdigest()
+
+        legacy_hashes = []
+        if source and source_key:
+            legacy_hashes.append(
+                hashlib.md5(f"{program['title']}:{detail_url}".encode()).hexdigest()
+            )
+        legacy_detail_url = detail_url.replace(
+            "careerProgramInfo.do", "careerProgramView.do",
+        )
+        if legacy_detail_url != detail_url:
+            legacy_hashes.append(hashlib.md5(
+                f"{program['title']}:{legacy_detail_url}".encode()
+            ).hexdigest())
+        for legacy_hash in dict.fromkeys(legacy_hashes):
+            await self._conn.execute(
+                "UPDATE OR IGNORE programs SET hash = ? WHERE hash = ?",
+                (program_hash, legacy_hash),
+            )
 
         cursor = await self._conn.execute(
             """INSERT INTO programs
                (title, category, program_type, department, description,
                 apply_start, apply_end, edu_start, edu_end, target,
                 competency, method, mileage, capacity, applicants,
-                status, detail_url, hash, scraped_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(hash) DO UPDATE SET
-                   title=excluded.title, category=excluded.category,
-                   program_type=excluded.program_type, department=excluded.department,
-                   description=excluded.description,
-                   apply_start=excluded.apply_start, apply_end=excluded.apply_end,
-                   edu_start=excluded.edu_start, edu_end=excluded.edu_end,
-                   target=excluded.target, competency=excluded.competency,
-                   method=excluded.method, mileage=excluded.mileage,
-                   capacity=excluded.capacity, applicants=excluded.applicants,
-                   status=excluded.status, updated_at=excluded.updated_at
+                status, source, source_key, status_code, detail_url,
+                hash, scraped_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(hash) DO NOTHING
             """,
             (
                 program["title"], program.get("category"), program.get("program_type"),
@@ -109,12 +163,34 @@ class Database:
                 program.get("target"), program.get("competency"),
                 program.get("method"), program.get("mileage", 0),
                 program.get("capacity", 0), program.get("applicants", 0),
-                program.get("status"), program.get("detail_url"),
+                program.get("status"), source, source_key, status_code, detail_url,
                 program_hash, now, now,
             ),
         )
+        is_new = cursor.rowcount == 1
+        if not is_new:
+            await self._conn.execute(
+                """UPDATE programs SET
+                       title=?, category=?, program_type=?, department=?, description=?,
+                       apply_start=?, apply_end=?, edu_start=?, edu_end=?, target=?,
+                       competency=?, method=?, mileage=?, capacity=?, applicants=?,
+                       status=?, source=?, source_key=?, status_code=?,
+                       detail_url=?, updated_at=?
+                   WHERE hash=?""",
+                (
+                    program["title"], program.get("category"), program.get("program_type"),
+                    program.get("department"), program.get("description"),
+                    program.get("apply_start"), program.get("apply_end"),
+                    program.get("edu_start"), program.get("edu_end"),
+                    program.get("target"), program.get("competency"),
+                    program.get("method"), program.get("mileage", 0),
+                    program.get("capacity", 0), program.get("applicants", 0),
+                    program.get("status"), source, source_key, status_code,
+                    detail_url, now, program_hash,
+                ),
+            )
         await self._conn.commit()
-        return cursor.lastrowid
+        return is_new
 
     async def get_programs(self, status: str = None, category: str = None,
                            limit: int = 20, offset: int = 0):
@@ -131,15 +207,16 @@ class Database:
         cursor = await self._conn.execute(query, params)
         return await cursor.fetchall()
 
-    async def get_new_unnotified_programs(self, user_id: int):
+    async def get_new_unnotified_programs(self, user_id: int, since: str):
         cursor = await self._conn.execute(
             """SELECT p.* FROM programs p
-               WHERE p.status = '모집중'
+               WHERE p.status IN ('모집중', '모집예정', '분반모집', '상태 미상')
+               AND p.scraped_at > ?
                AND p.id NOT IN (
                    SELECT program_id FROM notifications WHERE user_id = ?
                )
                ORDER BY p.scraped_at DESC""",
-            (user_id,),
+            (since, user_id),
         )
         return await cursor.fetchall()
 
@@ -169,6 +246,17 @@ class Database:
             "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
         )
         return await cursor.fetchone()
+
+    async def complete_onboarding(self, user_id: int):
+        now = datetime.now().isoformat()
+        await self._conn.execute(
+            """UPDATE users
+               SET onboarding_completed_at = COALESCE(onboarding_completed_at, ?),
+                   updated_at = ?
+               WHERE id = ?""",
+            (now, now, user_id),
+        )
+        await self._conn.commit()
 
     async def set_user_categories(self, user_id: int, categories: list[str]):
         await self._conn.execute(
@@ -235,6 +323,24 @@ class Database:
         )
         await self._conn.commit()
 
+    async def get_state(self, key: str) -> Optional[str]:
+        cursor = await self._conn.execute(
+            "SELECT value FROM app_state WHERE key = ?", (key,)
+        )
+        row = await cursor.fetchone()
+        return row["value"] if row else None
+
+    async def set_state(self, key: str, value: str):
+        now = datetime.now().isoformat()
+        await self._conn.execute(
+            """INSERT INTO app_state (key, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value, updated_at = excluded.updated_at""",
+            (key, value, now),
+        )
+        await self._conn.commit()
+
     async def get_matching_programs(self, user_id: int, limit: int = 10):
         categories = await self.get_user_categories(user_id)
         keywords = await self.get_user_keywords(user_id)
@@ -256,7 +362,11 @@ class Database:
             params.extend([f"%{kw}%" for kw in keywords])
 
         where = " OR ".join(conditions)
-        query = f"SELECT * FROM programs WHERE status = '모집중' AND ({where}) ORDER BY scraped_at DESC LIMIT ?"
+        query = (
+            "SELECT * FROM programs "
+            "WHERE status IN ('모집중', '모집예정', '분반모집', '상태 미상') "
+            f"AND ({where}) ORDER BY scraped_at DESC LIMIT ?"
+        )
         params.append(limit)
 
         cursor = await self._conn.execute(query, params)
