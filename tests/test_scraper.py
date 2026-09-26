@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import AsyncMock
 
+import httpx
 from bs4 import BeautifulSoup
 
-from scraper import SsuScraper
+from scraper import ScrapeSourceError, SsuScraper
 
 
 class ScraperTest(unittest.IsolatedAsyncioTestCase):
@@ -53,3 +55,72 @@ class ScraperTest(unittest.IsolatedAsyncioTestCase):
         program = self.scraper._extract_path_program(row)
 
         self.assertEqual(program["category"], "특강/워크숍")
+
+    def test_hyphenated_date_range_is_not_split_inside_date(self):
+        self.assertEqual(
+            self.scraper._split_date_range("2026-09-01 ~ 2026-09-30"),
+            ("2026-09-01", "2026-09-30"),
+        )
+
+    async def test_repeated_job_page_fails_instead_of_looping(self):
+        repeated_page = [
+            {"title": f"프로그램 {index}", "detail_url": f"https://example.com/{index}"}
+            for index in range(10)
+        ]
+        self.scraper._scrape_job_page = AsyncMock(return_value=repeated_page)
+
+        with self.assertRaises(ScrapeSourceError):
+            await self.scraper._scrape_job_center()
+
+        self.assertEqual(self.scraper._scrape_job_page.await_count, 2)
+
+    async def test_source_failure_is_not_reported_as_zero_results(self):
+        self.scraper._scrape_job_center = AsyncMock(
+            side_effect=ScrapeSourceError("network failed"),
+        )
+
+        with self.assertRaisesRegex(ScrapeSourceError, "All configured"):
+            await self.scraper.scrape_all()
+
+        self.assertEqual(
+            self.scraper.last_scrape_report["job_center"]["status"], "failed",
+        )
+        self.assertIn(
+            "network failed", self.scraper.last_scrape_report["job_center"]["error"],
+        )
+
+    async def test_zero_results_remain_a_successful_source_result(self):
+        self.scraper._scrape_job_center = AsyncMock(return_value=[])
+
+        programs = await self.scraper.scrape_all()
+
+        self.assertEqual(programs, [])
+        self.assertEqual(
+            self.scraper.last_scrape_report["job_center"],
+            {"status": "success", "count": 0},
+        )
+
+    def test_path_pagination_detects_parameter_and_last_page(self):
+        html = """
+        <input name="pageIndex" value="1">
+        <div class="pagination">
+          <a onclick="fn_egov_link_page(1)">1</a>
+          <a onclick="fn_egov_link_page(2)">2</a>
+          <a onclick="fn_egov_link_page(3)">3</a>
+        </div>
+        """
+
+        self.assertEqual(
+            self.scraper._path_pagination(html), ("pageIndex", 3),
+        )
+
+    def test_path_login_page_is_rejected_as_program_content(self):
+        request = httpx.Request("GET", "https://path.ssu.ac.kr/programs")
+        response = httpx.Response(
+            200,
+            request=request,
+            text='<input name="userId"><input name="userPwd" type="password">',
+        )
+
+        with self.assertRaises(ScrapeSourceError):
+            self.scraper._validate_path_content_response(response)

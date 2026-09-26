@@ -32,6 +32,14 @@ _HEADERS = {
 
 _COMPETENCIES = ["창의", "융합", "공동체", "의사소통", "리더십", "글로벌"]
 _PER_PAGE = 10
+_MAX_PAGES_PER_CATEGORY = 100
+_PATH_PAGINATION_SELECTORS = (
+    ".pagination", ".paging", ".paginate", ".paginationSet",
+)
+
+
+class ScrapeSourceError(RuntimeError):
+    pass
 
 
 class SsuScraper:
@@ -41,6 +49,7 @@ class SsuScraper:
         )
         self._http_client: httpx.AsyncClient | None = None
         self._scrape_lock = asyncio.Lock()
+        self.last_scrape_report: dict[str, dict] = {}
 
     async def close(self):
         await self.client.aclose()
@@ -49,29 +58,71 @@ class SsuScraper:
 
     async def scrape_all(self) -> list[dict]:
         programs = []
+        self.last_scrape_report = {}
+        successful_sources = 0
 
-        programs.extend(await self._scrape_job_center())
+        try:
+            job_programs = await self._scrape_job_center()
+            programs.extend(job_programs)
+            successful_sources += 1
+            self.last_scrape_report["job_center"] = {
+                "status": "success", "count": len(job_programs),
+            }
+        except Exception as error:
+            logger.exception("SSU Job collection failed")
+            self.last_scrape_report["job_center"] = {
+                "status": "failed", "count": 0, "error": str(error),
+            }
 
         if SSU_ID and SSU_PASSWORD:
-            path_programs = await self._scrape_ssu_path()
-            programs.extend(path_programs)
+            try:
+                path_programs = await self._scrape_ssu_path()
+                programs.extend(path_programs)
+                successful_sources += 1
+                self.last_scrape_report["ssu_path"] = {
+                    "status": "success", "count": len(path_programs),
+                }
+            except Exception as error:
+                logger.exception("SSU-PATH collection failed")
+                self.last_scrape_report["ssu_path"] = {
+                    "status": "failed", "count": 0, "error": str(error),
+                }
+        else:
+            self.last_scrape_report["ssu_path"] = {
+                "status": "skipped", "count": 0,
+            }
+
+        if successful_sources == 0:
+            raise ScrapeSourceError("All configured program sources failed")
 
         return programs
 
     async def _scrape_job_center(self) -> list[dict]:
         programs = []
         for category_code, category in SSU_JOB_CATEGORY_CODES.items():
-            page = 1
-            while True:
+            seen_pages = set()
+            for page in range(1, _MAX_PAGES_PER_CATEGORY + 1):
                 page_programs = await self._scrape_job_page(
                     page, category_code=category_code, category=category,
                 )
                 if not page_programs:
                     break
+                fingerprint = tuple(
+                    (program.get("detail_url"), program.get("title"))
+                    for program in page_programs
+                )
+                if fingerprint in seen_pages:
+                    raise ScrapeSourceError(
+                        f"Repeated SSU Job page for category {category_code}: {page}"
+                    )
+                seen_pages.add(fingerprint)
                 programs.extend(page_programs)
                 if len(page_programs) < _PER_PAGE:
                     break
-                page += 1
+            else:
+                raise ScrapeSourceError(
+                    f"SSU Job page limit reached for category {category_code}"
+                )
         return programs
 
     async def _scrape_job_page(
@@ -89,9 +140,10 @@ class SsuScraper:
             for program in programs:
                 program["category"] = category
             return programs
-        except Exception as e:
-            logger.error(f"Error scraping job center page {page}: {e}")
-            return []
+        except Exception as error:
+            raise ScrapeSourceError(
+                f"Failed SSU Job category {category_code} page {page}: {error}"
+            ) from error
 
     def _parse_job_programs(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
@@ -200,62 +252,121 @@ class SsuScraper:
         if not SSU_ID or not SSU_PASSWORD:
             return []
 
-        try:
-            if not self._http_client:
-                self._http_client = httpx.AsyncClient(
-                    timeout=30.0, headers=_HEADERS, follow_redirects=False,
-                )
-
-            logger.info("Getting SSU-PATH login page for cookies...")
-            login_page = await self._http_client.get(SSU_PATH_LOGIN_URL)
-            cookies = dict(login_page.cookies)
-
-            soup = BeautifulSoup(login_page.text, "lxml")
-            csrf_input = soup.select_one("input[name='CSRF_TOKEN']")
-            csrf_token = csrf_input.get("value", "") if csrf_input else ""
-
-            login_data = {
-                "userId": SSU_ID,
-                "userPwd": SSU_PASSWORD,
-                "rtnUrl": SSU_PATH_INDEX_URL,
-            }
-            if csrf_token:
-                login_data["CSRF_TOKEN"] = csrf_token
-
-            logger.info("Posting SSU-PATH login...")
-            login_response = await self._http_client.post(
-                SSU_PATH_LOGIN_URL,
-                data=login_data,
-                cookies=cookies,
-                follow_redirects=False,
+        if not self._http_client:
+            self._http_client = httpx.AsyncClient(
+                timeout=30.0, headers=_HEADERS, follow_redirects=False,
             )
 
-            if login_response.status_code in (302, 303):
-                logger.info("Login successful (redirect received)")
-                new_cookies = dict(login_response.cookies)
-                cookies.update(new_cookies)
-            elif "로그인에 실패했습니다" in login_response.text:
-                logger.error("SSU-PATH login failed: incorrect credentials")
-                return []
-            else:
-                logger.warning(f"Unexpected login response: {login_response.status_code}")
+        logger.info("Getting SSU-PATH login page for cookies...")
+        login_page = await self._http_client.get(SSU_PATH_LOGIN_URL)
+        login_page.raise_for_status()
 
-            response = await self._http_client.get(SSU_PATH_LIST_URL, cookies=cookies)
+        soup = BeautifulSoup(login_page.text, "lxml")
+        csrf_input = soup.select_one("input[name='CSRF_TOKEN']")
+        csrf_token = csrf_input.get("value", "") if csrf_input else ""
 
-            if response.status_code == 302:
-                logger.warning("Still redirected to login - session not established")
-                redirect_url = response.headers.get("location", "")
-                logger.info(f"Redirected to: {redirect_url}")
-                return []
+        login_data = {
+            "userId": SSU_ID,
+            "userPwd": SSU_PASSWORD,
+            "rtnUrl": SSU_PATH_INDEX_URL,
+        }
+        if csrf_token:
+            login_data["CSRF_TOKEN"] = csrf_token
 
-            response.raise_for_status()
+        logger.info("Posting SSU-PATH login...")
+        login_response = await self._http_client.post(
+            SSU_PATH_LOGIN_URL,
+            data=login_data,
+            follow_redirects=False,
+        )
+        self._validate_path_login_response(login_response)
 
-            logger.info(f"SSU-PATH list response: {response.status_code}")
-            return self._parse_path_programs(response.text)
+        response = await self._http_client.get(SSU_PATH_LIST_URL)
+        self._validate_path_content_response(response)
+        programs = self._parse_path_programs(response.text)
 
-        except Exception as e:
-            logger.error(f"Error scraping SSU-PATH: {e}")
-            return []
+        page_parameter, last_page = self._path_pagination(response.text)
+        for page in range(2, last_page + 1):
+            page_response = await self._http_client.get(
+                SSU_PATH_LIST_URL, params={page_parameter: str(page)},
+            )
+            self._validate_path_content_response(page_response)
+            page_programs = self._parse_path_programs(page_response.text)
+            if not page_programs:
+                raise ScrapeSourceError(
+                    f"SSU-PATH page {page} was empty before page {last_page}"
+                )
+            programs.extend(page_programs)
+
+        logger.info("SSU-PATH list response: %s", response.status_code)
+        return programs
+
+    @staticmethod
+    def _looks_like_path_login(html: str) -> bool:
+        soup = BeautifulSoup(html, "lxml")
+        return bool(
+            soup.select_one("input[type='password']")
+            and soup.select_one("input[name='userId'], input[name='userPwd']")
+        )
+
+    def _validate_path_login_response(self, response: httpx.Response):
+        if "로그인에 실패했습니다" in response.text:
+            raise ScrapeSourceError("SSU-PATH rejected the configured credentials")
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("location", "")
+            if "login" in location.lower():
+                raise ScrapeSourceError(
+                    f"SSU-PATH redirected back to login: {location}"
+                )
+            return
+        response.raise_for_status()
+        if self._looks_like_path_login(response.text):
+            raise ScrapeSourceError("SSU-PATH returned the login page after login")
+
+    def _validate_path_content_response(self, response: httpx.Response):
+        if response.is_redirect:
+            location = response.headers.get("location", "")
+            raise ScrapeSourceError(
+                f"SSU-PATH program list redirected unexpectedly: {location}"
+            )
+        response.raise_for_status()
+        if self._looks_like_path_login(response.text):
+            raise ScrapeSourceError(
+                "SSU-PATH program list returned a login page"
+            )
+
+    @staticmethod
+    def _path_pagination(html: str) -> tuple[str | None, int]:
+        soup = BeautifulSoup(html, "lxml")
+        container = next(
+            (soup.select_one(selector) for selector in _PATH_PAGINATION_SELECTORS
+             if soup.select_one(selector)),
+            None,
+        )
+        if not container:
+            return None, 1
+
+        pages = [
+            int(text) for text in container.stripped_strings
+            if text.isdigit() and int(text) > 0
+        ]
+        last_page = max(pages, default=1)
+        if last_page == 1:
+            return None, 1
+
+        markup = str(container)
+        parameter_names = (
+            "paginationInfo.currentPageNo", "currentPageNo", "pageIndex", "pageNo",
+        )
+        for parameter in parameter_names:
+            if parameter in markup or soup.select_one(f"input[name='{parameter}']"):
+                return parameter, last_page
+
+        if "fn_egov_link_page" in markup:
+            return "pageIndex", last_page
+        raise ScrapeSourceError(
+            "SSU-PATH pagination exists but its page parameter is unknown"
+        )
 
     def _parse_path_programs(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
@@ -325,7 +436,7 @@ class SsuScraper:
 
     @staticmethod
     def _split_date_range(value: str) -> tuple[str, str]:
-        match = re.split(r"\s*[~\-]\s*", value, maxsplit=1)
+        match = re.split(r"\s*~\s*|\s+[\-–—]\s+", value, maxsplit=1)
         if len(match) == 2:
             return match[0].strip(), match[1].strip()
         return value.strip(), ""

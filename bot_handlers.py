@@ -1,3 +1,5 @@
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -6,6 +8,8 @@ from config import CATEGORIES, CATEGORY_EMOJI, STATUS_EMOJI
 from database import Database
 from scraper import SsuScraper
 from notifier import Notifier
+
+logger = logging.getLogger(__name__)
 
 
 def setup_bot(bot: commands.Bot, db: Database, scraper: SsuScraper, notifier: Notifier):
@@ -98,13 +102,19 @@ def setup_bot(bot: commands.Bot, db: Database, scraper: SsuScraper, notifier: No
     @bot.tree.command(name="새로고침", description="프로그램 목록을 즉시 업데이트합니다")
     async def cmd_refresh(interaction: discord.Interaction):
         await interaction.response.send_message("🔄 프로그램 목록을 업데이트 중...", ephemeral=True)
-        count = await scraper.scrape_and_store(db)
-        await interaction.edit_original_response(
-            content=(
-                f"✅ 업데이트 완료! 신규 프로그램 {count}개를 발견했습니다.\n"
-                "`/프로그램`으로 확인하세요."
+        try:
+            count = await scraper.scrape_and_store(db)
+            await interaction.edit_original_response(
+                content=(
+                    f"✅ 업데이트 완료! 신규 프로그램 {count}개를 발견했습니다.\n"
+                    "`/프로그램`으로 확인하세요."
+                )
             )
-        )
+        except Exception:
+            logger.exception("Manual program refresh failed")
+            await interaction.edit_original_response(
+                content="⚠️ 프로그램 업데이트에 실패했습니다. 잠시 후 다시 시도해주세요."
+            )
 
     @bot.tree.command(name="키워드추가", description="관심 키워드를 추가합니다 (예: AI, 데이터)")
     @app_commands.describe(keyword="추가할 키워드")
