@@ -9,12 +9,9 @@ SCRAPE_INTERVAL_HOURS = int(os.getenv("SCRAPE_INTERVAL_HOURS", "6"))
 
 SSU_JOB_LIST_URL = "https://job.ssu.ac.kr/service/careerProgram/careerProgramList.do"
 SSU_JOB_DETAIL_URL = "https://job.ssu.ac.kr/service/careerProgram/careerProgramInfo.do"
-SSU_PATH_BASE_URL = "https://path.ssu.ac.kr"
-SSU_PATH_LOGIN_URL = "https://path.ssu.ac.kr/comm/login/user/login.do"
-SSU_PATH_INDEX_URL = "https://path.ssu.ac.kr/index.do"
-SSU_PATH_LIST_URL = "https://path.ssu.ac.kr/ptfol/imng/icmpNsbjtPgm/findIcmpNsbjtPgmList.do"
-SSU_ID = os.getenv("SSU_ID", "")
-SSU_PASSWORD = os.getenv("SSU_PASSWORD", "")
+SSU_PATH_LIST_URL = (
+    "https://path.ssu.ac.kr/ptfol/imng/icmpNsbjtPgm/dialog/nsbjtPgmList.do"
+)
 CATEGORIES = [
     "상담/멘토링/코칭",
     "공모전/경진대회",
@@ -56,7 +53,10 @@ CATEGORY_EMOJI = {
 
 STATUS_EMOJI = {
     "모집중": "🟢",
+    "모집예정": "🟡",
     "모집대기": "🟡",
+    "모집종료": "🔴",
+    "상태 미상": "⚪",
     "종료": "🔴",
     "분반모집": "🔵",
 }

@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -11,12 +12,7 @@ from config import (
     SSU_JOB_LIST_URL,
     SSU_JOB_DETAIL_URL,
     SSU_JOB_CATEGORY_CODES,
-    SSU_PATH_BASE_URL,
-    SSU_PATH_LOGIN_URL,
-    SSU_PATH_INDEX_URL,
     SSU_PATH_LIST_URL,
-    SSU_ID,
-    SSU_PASSWORD,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,8 +29,12 @@ _HEADERS = {
 _COMPETENCIES = ["창의", "융합", "공동체", "의사소통", "리더십", "글로벌"]
 _PER_PAGE = 10
 _MAX_PAGES_PER_CATEGORY = 100
-_PATH_PAGINATION_SELECTORS = (
-    ".pagination", ".paging", ".paginate", ".paginationSet",
+_PATH_MAX_PAGES = 100
+_PATH_PUBLIC_LIST_URL = SSU_PATH_LIST_URL
+_SEOUL_TIMEZONE = ZoneInfo("Asia/Seoul")
+_PATH_LIST_COLUMNS = (
+    "번호", "년도", "학기", "운영부서", "프로그램명",
+    "신청기간", "교육기간", "모집정원", "진행상태",
 )
 
 
@@ -74,22 +74,17 @@ class SsuScraper:
                 "status": "failed", "count": 0, "error": str(error),
             }
 
-        if SSU_ID and SSU_PASSWORD:
-            try:
-                path_programs = await self._scrape_ssu_path()
-                programs.extend(path_programs)
-                successful_sources += 1
-                self.last_scrape_report["ssu_path"] = {
-                    "status": "success", "count": len(path_programs),
-                }
-            except Exception as error:
-                logger.exception("SSU-PATH collection failed")
-                self.last_scrape_report["ssu_path"] = {
-                    "status": "failed", "count": 0, "error": str(error),
-                }
-        else:
+        try:
+            path_programs = await self._scrape_ssu_path()
+            programs.extend(path_programs)
+            successful_sources += 1
             self.last_scrape_report["ssu_path"] = {
-                "status": "skipped", "count": 0,
+                "status": "success", "count": len(path_programs),
+            }
+        except Exception as error:
+            logger.exception("SSU-PATH collection failed")
+            self.last_scrape_report["ssu_path"] = {
+                "status": "failed", "count": 0, "error": str(error),
             }
 
         if successful_sources == 0:
@@ -130,7 +125,7 @@ class SsuScraper:
     ) -> list[dict]:
         data = {
             "currentPageNo": str(page),
-            "operYySh": str(datetime.now().year),
+            "operYySh": str(datetime.now(_SEOUL_TIMEZONE).year),
             "prgmClsCdSh": category_code,
         }
         try:
@@ -249,48 +244,43 @@ class SsuScraper:
         return "기타"
 
     async def _scrape_ssu_path(self) -> list[dict]:
-        if not SSU_ID or not SSU_PASSWORD:
-            return []
-
         if not self._http_client:
             self._http_client = httpx.AsyncClient(
                 timeout=30.0, headers=_HEADERS, follow_redirects=False,
             )
 
-        logger.info("Getting SSU-PATH login page for cookies...")
-        login_page = await self._http_client.get(SSU_PATH_LOGIN_URL)
-        login_page.raise_for_status()
-
-        soup = BeautifulSoup(login_page.text, "lxml")
-        csrf_input = soup.select_one("input[name='CSRF_TOKEN']")
-        csrf_token = csrf_input.get("value", "") if csrf_input else ""
-
-        login_data = {
-            "userId": SSU_ID,
-            "userPwd": SSU_PASSWORD,
-            "rtnUrl": SSU_PATH_INDEX_URL,
-        }
-        if csrf_token:
-            login_data["CSRF_TOKEN"] = csrf_token
-
-        logger.info("Posting SSU-PATH login...")
-        login_response = await self._http_client.post(
-            SSU_PATH_LOGIN_URL,
-            data=login_data,
-            follow_redirects=False,
-        )
-        self._validate_path_login_response(login_response)
-
-        response = await self._http_client.get(SSU_PATH_LIST_URL)
+        # SSU-PATH publishes this external-user list without authentication.
+        # The login page now uses SSO or an encrypted external-user form; it is
+        # unrelated to this public endpoint and does not expose a CSRF token.
+        response = await self._http_client.get(_PATH_PUBLIC_LIST_URL)
         self._validate_path_content_response(response)
         programs = self._parse_path_programs(response.text)
 
-        page_parameter, last_page = self._path_pagination(response.text)
+        page_parameter, current_page, last_page = self._path_pagination_info(
+            response.text,
+        )
+        if current_page != 1:
+            raise ScrapeSourceError(
+                f"SSU-PATH first response was page {current_page}, expected page 1"
+            )
+        if last_page > _PATH_MAX_PAGES:
+            raise ScrapeSourceError(
+                f"SSU-PATH page limit exceeded: {last_page} pages"
+            )
         for page in range(2, last_page + 1):
             page_response = await self._http_client.get(
-                SSU_PATH_LIST_URL, params={page_parameter: str(page)},
+                _PATH_PUBLIC_LIST_URL,
+                params={page_parameter or "currentPageNo": str(page)},
             )
             self._validate_path_content_response(page_response)
+            _parameter, returned_page, returned_last_page = (
+                self._path_pagination_info(page_response.text)
+            )
+            if returned_page != page or returned_last_page != last_page:
+                raise ScrapeSourceError(
+                    "SSU-PATH pagination response did not match the requested page "
+                    f"({page}; received {returned_page} of {returned_last_page})"
+                )
             page_programs = self._parse_path_programs(page_response.text)
             if not page_programs:
                 raise ScrapeSourceError(
@@ -301,28 +291,6 @@ class SsuScraper:
         logger.info("SSU-PATH list response: %s", response.status_code)
         return programs
 
-    @staticmethod
-    def _looks_like_path_login(html: str) -> bool:
-        soup = BeautifulSoup(html, "lxml")
-        return bool(
-            soup.select_one("input[type='password']")
-            and soup.select_one("input[name='userId'], input[name='userPwd']")
-        )
-
-    def _validate_path_login_response(self, response: httpx.Response):
-        if "로그인에 실패했습니다" in response.text:
-            raise ScrapeSourceError("SSU-PATH rejected the configured credentials")
-        if response.status_code in (301, 302, 303, 307, 308):
-            location = response.headers.get("location", "")
-            if "login" in location.lower():
-                raise ScrapeSourceError(
-                    f"SSU-PATH redirected back to login: {location}"
-                )
-            return
-        response.raise_for_status()
-        if self._looks_like_path_login(response.text):
-            raise ScrapeSourceError("SSU-PATH returned the login page after login")
-
     def _validate_path_content_response(self, response: httpx.Response):
         if response.is_redirect:
             location = response.headers.get("location", "")
@@ -330,109 +298,169 @@ class SsuScraper:
                 f"SSU-PATH program list redirected unexpectedly: {location}"
             )
         response.raise_for_status()
-        if self._looks_like_path_login(response.text):
-            raise ScrapeSourceError(
-                "SSU-PATH program list returned a login page"
-            )
+        if not self._has_path_list_markup(response.text):
+            raise ScrapeSourceError("SSU-PATH response is not a public program list")
+
+    @staticmethod
+    def _has_path_list_markup(html: str) -> bool:
+        soup = BeautifulSoup(html, "lxml")
+        table = soup.select_one("table.t_list")
+        if not table:
+            return False
+        headers = tuple(
+            cell.get_text(" ", strip=True)
+            for cell in table.select("thead th")
+        )
+        return headers == _PATH_LIST_COLUMNS
+
+    @staticmethod
+    def _path_pagination_info(html: str) -> tuple[str | None, int, int]:
+        soup = BeautifulSoup(html, "lxml")
+        page_list = soup.select_one("ul.page_list")
+        current_page = soup.select_one("form#baseForm input[name='currentPageNo']")
+        page_summary = soup.select_one("ul.tab_bottom")
+        summary_text = page_summary.get_text(" ", strip=True) if page_summary else ""
+        summary = re.search(r"페이지\s+(\d+)\s*/\s*(\d+)", summary_text)
+
+        if not current_page and not page_list and not page_summary:
+            return None, 1, 1
+        if not current_page:
+            raise ScrapeSourceError("SSU-PATH pagination omitted currentPageNo")
+
+        current_value = current_page.get("value", "")
+        if not current_value.isdigit():
+            raise ScrapeSourceError("SSU-PATH currentPageNo was not numeric")
+        current_number = int(current_value)
+
+        if summary:
+            summary_current = int(summary.group(1))
+            last_number = int(summary.group(2))
+            if summary_current != current_number:
+                raise ScrapeSourceError(
+                    "SSU-PATH page summary disagrees with currentPageNo"
+                )
+        else:
+            page_numbers = []
+            if page_list:
+                for link in page_list.select("a[onclick]"):
+                    page_match = re.search(
+                        r"global\.dialog\.page\((\d+)\)",
+                        link.get("onclick", ""),
+                    )
+                    if page_match:
+                        page_numbers.append(int(page_match.group(1)))
+            if page_numbers:
+                last_number = max(page_numbers)
+            elif page_list or page_summary:
+                raise ScrapeSourceError(
+                    "SSU-PATH pagination omitted its page summary"
+                )
+            else:
+                last_number = current_number
+
+        if last_number < current_number:
+            raise ScrapeSourceError("SSU-PATH currentPageNo exceeded its last page")
+        return current_page.get("name"), current_number, last_number
 
     @staticmethod
     def _path_pagination(html: str) -> tuple[str | None, int]:
-        soup = BeautifulSoup(html, "lxml")
-        container = next(
-            (soup.select_one(selector) for selector in _PATH_PAGINATION_SELECTORS
-             if soup.select_one(selector)),
-            None,
-        )
-        if not container:
-            return None, 1
-
-        pages = [
-            int(text) for text in container.stripped_strings
-            if text.isdigit() and int(text) > 0
-        ]
-        last_page = max(pages, default=1)
-        if last_page == 1:
-            return None, 1
-
-        markup = str(container)
-        parameter_names = (
-            "paginationInfo.currentPageNo", "currentPageNo", "pageIndex", "pageNo",
-        )
-        for parameter in parameter_names:
-            if parameter in markup or soup.select_one(f"input[name='{parameter}']"):
-                return parameter, last_page
-
-        if "fn_egov_link_page" in markup:
-            return "pageIndex", last_page
-        raise ScrapeSourceError(
-            "SSU-PATH pagination exists but its page parameter is unknown"
-        )
+        parameter, _current_page, last_page = SsuScraper._path_pagination_info(html)
+        return parameter, last_page
 
     def _parse_path_programs(self, html: str) -> list[dict]:
         soup = BeautifulSoup(html, "lxml")
         programs = []
 
-        cards = soup.select("tr")
-        for card in cards:
-            try:
-                program = self._extract_path_program(card)
-                if program and len(program.get("title", "")) > 5:
-                    program["source"] = "ssu_path"
-                    programs.append(program)
-            except Exception as e:
-                logger.warning(f"Failed to parse path card: {e}")
+        table = soup.select_one("table.t_list")
+        if not table:
+            raise ScrapeSourceError("SSU-PATH public list table was not found")
+        for card in table.select("tbody tr"):
+            cells = card.select("td")
+            if not cells:
+                continue
+            if len(cells) == 1 and cells[0].has_attr("colspan"):
+                continue
+            if len(cells) != len(_PATH_LIST_COLUMNS):
+                raise ScrapeSourceError(
+                    "SSU-PATH row did not match the observed 9-column public list"
+                )
+            program = self._extract_path_program(card)
+            if not program or not program.get("title"):
+                raise ScrapeSourceError(
+                    "SSU-PATH row had no program title; refusing partial results"
+                )
+            program["source"] = "ssu_path"
+            programs.append(program)
         return programs
 
     def _extract_path_program(self, card: Tag) -> dict | None:
         cells = card.select("td")
-        if len(cells) < 2:
+        if len(cells) < 9:
             return None
 
-        first_cell = cells[0]
-        title_el = first_cell.select_one("a")
-        title = title_el.get_text(strip=True) if title_el else first_cell.get_text(strip=True)
+        title = cells[4].get_text(" ", strip=True)
+        if not title:
+            raise ScrapeSourceError("SSU-PATH row had an empty program title")
 
-        if not title or len(title) < 5:
-            return None
-
-        status = "모집중"
-        if len(cells) > 1:
-            status_cell = cells[1]
-            status = status_cell.get_text(strip=True) or "모집중"
-
-        description = ""
-        if len(cells) > 2:
-            desc_el = cells[2].select_one("div")
-            description = desc_el.get_text(strip=True)[:200] if desc_el else ""
-
-        detail_url = ""
-        if title_el:
-            href = title_el.get("href", "")
-            if href.startswith("/"):
-                detail_url = f"{SSU_PATH_BASE_URL}{href}"
-            elif href.startswith("http"):
-                detail_url = href
-
-        apply_start = ""
-        apply_end = ""
-        text = card.get_text(separator=" ", strip=True)
-        dates = re.findall(r"\d{4}\.\d{2}\.\d{2}", text)
-        if len(dates) >= 1:
-            apply_start = dates[0]
-        if len(dates) >= 2:
-            apply_end = dates[1]
+        apply_start, apply_end = self._split_date_range(
+            cells[5].get_text(" ", strip=True),
+        )
+        edu_start, edu_end = self._split_date_range(
+            cells[6].get_text(" ", strip=True),
+        )
+        status_code = cells[8].get_text(" ", strip=True)
+        status = self._path_status_from_dates(apply_start, apply_end)
+        capacity_text = cells[7].get_text(" ", strip=True).replace(",", "")
+        capacity_match = re.search(r"\d+", capacity_text)
+        capacity = int(capacity_match.group()) if capacity_match else 0
+        year = cells[1].get_text(" ", strip=True)
+        semester = cells[2].get_text(" ", strip=True)
+        department = cells[3].get_text(" ", strip=True)
+        # The public dialog has no item URL or server-side program ID. Use the
+        # stable identifying fields it does expose instead of collapsing all
+        # same-title rows into one SQLite record.
+        source_key = json.dumps(
+            [year, semester, department, title, edu_start, edu_end],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
         return {
             "title": title,
-            "category": self._infer_category(title, description),
+            "category": self._infer_category(title),
             "status": status,
-            "department": "숭실대학교",
+            "status_code": status_code,
+            "source": "ssu_path",
+            "source_key": source_key,
+            "department": department,
             "program_type": "비교과",
-            "description": description,
+            "description": "",
             "apply_start": apply_start,
             "apply_end": apply_end,
-            "detail_url": detail_url,
+            "edu_start": edu_start,
+            "edu_end": edu_end,
+            "capacity": capacity,
+            "detail_url": "",
         }
+
+    @staticmethod
+    def _path_status_from_dates(apply_start: str, apply_end: str, today=None) -> str:
+        """Infer a user-facing status; the public list exposes only a numeric code."""
+        try:
+            start = datetime.strptime(apply_start, "%Y.%m.%d").date()
+            end = (
+                datetime.strptime(apply_end, "%Y.%m.%d").date()
+                if apply_end else start
+            )
+        except ValueError:
+            return "상태 미상"
+
+        today = today or datetime.now(_SEOUL_TIMEZONE).date()
+        if today < start:
+            return "모집예정"
+        if today > end:
+            return "모집종료"
+        return "모집중"
 
     @staticmethod
     def _split_date_range(value: str) -> tuple[str, str]:

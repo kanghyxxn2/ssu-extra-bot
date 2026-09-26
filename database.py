@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS programs (
     capacity INTEGER DEFAULT 0,
     applicants INTEGER DEFAULT 0,
     status TEXT,
+    source TEXT,
+    source_key TEXT,
+    status_code TEXT,
     detail_url TEXT,
     hash TEXT UNIQUE NOT NULL,
     scraped_at TEXT NOT NULL,
@@ -82,6 +85,18 @@ class Database:
         await self._conn.commit()
 
     async def _migrate_schema(self):
+        cursor = await self._conn.execute("PRAGMA table_info(programs)")
+        program_columns = {row["name"] for row in await cursor.fetchall()}
+        for column, declaration in (
+            ("source", "TEXT"),
+            ("source_key", "TEXT"),
+            ("status_code", "TEXT"),
+        ):
+            if column not in program_columns:
+                await self._conn.execute(
+                    f"ALTER TABLE programs ADD COLUMN {column} {declaration}"
+                )
+
         cursor = await self._conn.execute("PRAGMA table_info(users)")
         columns = {row["name"] for row in await cursor.fetchall()}
         if "onboarding_completed_at" not in columns:
@@ -100,17 +115,31 @@ class Database:
     async def upsert_program(self, program: dict) -> bool:
         now = datetime.now().isoformat()
         detail_url = program.get("detail_url", "")
+        source = program.get("source")
+        source_key = program.get("source_key")
+        status_code = program.get("status_code")
+        identity = (
+            f"{source}:{source_key}"
+            if source and source_key
+            else f"{program['title']}:{detail_url}"
+        )
         program_hash = hashlib.md5(
-            f"{program['title']}:{detail_url}".encode()
+            identity.encode()
         ).hexdigest()
 
+        legacy_hashes = []
+        if source and source_key:
+            legacy_hashes.append(
+                hashlib.md5(f"{program['title']}:{detail_url}".encode()).hexdigest()
+            )
         legacy_detail_url = detail_url.replace(
             "careerProgramInfo.do", "careerProgramView.do",
         )
         if legacy_detail_url != detail_url:
-            legacy_hash = hashlib.md5(
+            legacy_hashes.append(hashlib.md5(
                 f"{program['title']}:{legacy_detail_url}".encode()
-            ).hexdigest()
+            ).hexdigest())
+        for legacy_hash in dict.fromkeys(legacy_hashes):
             await self._conn.execute(
                 "UPDATE OR IGNORE programs SET hash = ? WHERE hash = ?",
                 (program_hash, legacy_hash),
@@ -121,8 +150,9 @@ class Database:
                (title, category, program_type, department, description,
                 apply_start, apply_end, edu_start, edu_end, target,
                 competency, method, mileage, capacity, applicants,
-                status, detail_url, hash, scraped_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, source, source_key, status_code, detail_url,
+                hash, scraped_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(hash) DO NOTHING
             """,
             (
@@ -133,7 +163,7 @@ class Database:
                 program.get("target"), program.get("competency"),
                 program.get("method"), program.get("mileage", 0),
                 program.get("capacity", 0), program.get("applicants", 0),
-                program.get("status"), detail_url,
+                program.get("status"), source, source_key, status_code, detail_url,
                 program_hash, now, now,
             ),
         )
@@ -144,7 +174,8 @@ class Database:
                        title=?, category=?, program_type=?, department=?, description=?,
                        apply_start=?, apply_end=?, edu_start=?, edu_end=?, target=?,
                        competency=?, method=?, mileage=?, capacity=?, applicants=?,
-                       status=?, detail_url=?, updated_at=?
+                       status=?, source=?, source_key=?, status_code=?,
+                       detail_url=?, updated_at=?
                    WHERE hash=?""",
                 (
                     program["title"], program.get("category"), program.get("program_type"),
@@ -154,7 +185,8 @@ class Database:
                     program.get("target"), program.get("competency"),
                     program.get("method"), program.get("mileage", 0),
                     program.get("capacity", 0), program.get("applicants", 0),
-                    program.get("status"), program.get("detail_url"), now, program_hash,
+                    program.get("status"), source, source_key, status_code,
+                    detail_url, now, program_hash,
                 ),
             )
         await self._conn.commit()
@@ -178,7 +210,7 @@ class Database:
     async def get_new_unnotified_programs(self, user_id: int, since: str):
         cursor = await self._conn.execute(
             """SELECT p.* FROM programs p
-               WHERE p.status IN ('모집중', '분반모집')
+               WHERE p.status IN ('모집중', '모집예정', '분반모집', '상태 미상')
                AND p.scraped_at > ?
                AND p.id NOT IN (
                    SELECT program_id FROM notifications WHERE user_id = ?
@@ -332,7 +364,7 @@ class Database:
         where = " OR ".join(conditions)
         query = (
             "SELECT * FROM programs "
-            "WHERE status IN ('모집중', '분반모집') "
+            "WHERE status IN ('모집중', '모집예정', '분반모집', '상태 미상') "
             f"AND ({where}) ORDER BY scraped_at DESC LIMIT ?"
         )
         params.append(limit)

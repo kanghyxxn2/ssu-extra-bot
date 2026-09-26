@@ -29,6 +29,33 @@ class DatabaseTest(unittest.IsolatedAsyncioTestCase):
         rows = await self.db.get_programs()
         self.assertEqual(rows[0]["description"], "변경된 설명")
 
+    async def test_path_program_identity_and_numeric_status_are_persisted(self):
+        first = {
+            "title": "관심사 특강",
+            "category": "특강/워크숍",
+            "status": "모집예정",
+            "status_code": "1",
+            "source": "ssu_path",
+            "source_key": '["2026","2학기","교육혁신팀","관심사 특강","2026.10.01","2026.10.02"]',
+        }
+        same_title_other_program = {
+            **first,
+            "department": "진로취업팀",
+            "source_key": '["2026","2학기","진로취업팀","관심사 특강","2026.10.01","2026.10.02"]',
+            "status_code": "2",
+        }
+
+        self.assertTrue(await self.db.upsert_program(first))
+        self.assertTrue(await self.db.upsert_program(same_title_other_program))
+        self.assertFalse(await self.db.upsert_program({**first, "capacity": 30}))
+
+        rows = await self.db.get_programs()
+        self.assertEqual(len(rows), 2)
+        rows_by_key = {row["source_key"]: row for row in rows}
+        self.assertEqual(rows_by_key[first["source_key"]]["status_code"], "1")
+        self.assertEqual(rows_by_key[first["source_key"]]["capacity"], 30)
+        self.assertEqual(rows_by_key[same_title_other_program["source_key"]]["status_code"], "2")
+
     async def test_category_matching_includes_multi_class_programs(self):
         user_id = await self.db.add_user(1234, "tester")
         await self.db.set_user_categories(user_id, ["특강/워크숍"])
@@ -95,12 +122,41 @@ class DatabaseTest(unittest.IsolatedAsyncioTestCase):
             "status": "모집중",
             "detail_url": "https://example.com/program/new",
         })
+        await self.db.upsert_program({
+            "title": "예정 특강",
+            "category": "특강/워크숍",
+            "status": "모집예정",
+            "detail_url": "https://example.com/program/upcoming",
+        })
+        await self.db.upsert_program({
+            "title": "일정 미상 특강",
+            "category": "특강/워크숍",
+            "status": "상태 미상",
+            "detail_url": "https://example.com/program/unknown",
+        })
 
         programs = await self.db.get_new_unnotified_programs(
             user_id, user["onboarding_completed_at"],
         )
 
-        self.assertEqual([row["title"] for row in programs], ["신규 특강"])
+        self.assertEqual(
+            {row["title"] for row in programs},
+            {"신규 특강", "예정 특강", "일정 미상 특강"},
+        )
+
+    async def test_upcoming_programs_are_available_for_interest_matching(self):
+        user_id = await self.db.add_user(1515, "tester")
+        await self.db.set_user_categories(user_id, ["특강/워크숍"])
+        await self.db.upsert_program({
+            "title": "다음 달 진로 특강",
+            "category": "특강/워크숍",
+            "status": "모집예정",
+            "detail_url": "https://example.com/program/upcoming",
+        })
+
+        matches = await self.db.get_matching_programs(user_id)
+
+        self.assertEqual([row["title"] for row in matches], ["다음 달 진로 특강"])
 
     async def test_complete_onboarding_keeps_original_timestamp(self):
         user_id = await self.db.add_user(1010, "tester")
@@ -141,5 +197,28 @@ class DatabaseMigrationTest(unittest.IsolatedAsyncioTestCase):
             try:
                 user = await db.get_user(1)
                 self.assertIsNotNone(user["onboarding_completed_at"])
+            finally:
+                await db.close()
+
+    async def test_existing_programs_gain_path_identity_and_status_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "legacy-programs.db"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                """CREATE TABLE programs (
+                       id INTEGER PRIMARY KEY,
+                       title TEXT NOT NULL,
+                       hash TEXT UNIQUE NOT NULL
+                   )"""
+            )
+            connection.commit()
+            connection.close()
+
+            db = Database(str(db_path))
+            await db.init()
+            try:
+                cursor = await db._conn.execute("PRAGMA table_info(programs)")
+                columns = {row["name"] for row in await cursor.fetchall()}
+                self.assertTrue({"source", "source_key", "status_code"}.issubset(columns))
             finally:
                 await db.close()
