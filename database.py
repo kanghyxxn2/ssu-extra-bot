@@ -77,11 +77,24 @@ class Database:
         if self._conn:
             await self._conn.close()
 
-    async def upsert_program(self, program: dict) -> Optional[int]:
+    async def upsert_program(self, program: dict) -> bool:
         now = datetime.now().isoformat()
+        detail_url = program.get("detail_url", "")
         program_hash = hashlib.md5(
-            f"{program['title']}:{program.get('detail_url', '')}".encode()
+            f"{program['title']}:{detail_url}".encode()
         ).hexdigest()
+
+        legacy_detail_url = detail_url.replace(
+            "careerProgramInfo.do", "careerProgramView.do",
+        )
+        if legacy_detail_url != detail_url:
+            legacy_hash = hashlib.md5(
+                f"{program['title']}:{legacy_detail_url}".encode()
+            ).hexdigest()
+            await self._conn.execute(
+                "UPDATE OR IGNORE programs SET hash = ? WHERE hash = ?",
+                (program_hash, legacy_hash),
+            )
 
         cursor = await self._conn.execute(
             """INSERT INTO programs
@@ -90,16 +103,7 @@ class Database:
                 competency, method, mileage, capacity, applicants,
                 status, detail_url, hash, scraped_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(hash) DO UPDATE SET
-                   title=excluded.title, category=excluded.category,
-                   program_type=excluded.program_type, department=excluded.department,
-                   description=excluded.description,
-                   apply_start=excluded.apply_start, apply_end=excluded.apply_end,
-                   edu_start=excluded.edu_start, edu_end=excluded.edu_end,
-                   target=excluded.target, competency=excluded.competency,
-                   method=excluded.method, mileage=excluded.mileage,
-                   capacity=excluded.capacity, applicants=excluded.applicants,
-                   status=excluded.status, updated_at=excluded.updated_at
+               ON CONFLICT(hash) DO NOTHING
             """,
             (
                 program["title"], program.get("category"), program.get("program_type"),
@@ -109,12 +113,32 @@ class Database:
                 program.get("target"), program.get("competency"),
                 program.get("method"), program.get("mileage", 0),
                 program.get("capacity", 0), program.get("applicants", 0),
-                program.get("status"), program.get("detail_url"),
+                program.get("status"), detail_url,
                 program_hash, now, now,
             ),
         )
+        is_new = cursor.rowcount == 1
+        if not is_new:
+            await self._conn.execute(
+                """UPDATE programs SET
+                       title=?, category=?, program_type=?, department=?, description=?,
+                       apply_start=?, apply_end=?, edu_start=?, edu_end=?, target=?,
+                       competency=?, method=?, mileage=?, capacity=?, applicants=?,
+                       status=?, detail_url=?, updated_at=?
+                   WHERE hash=?""",
+                (
+                    program["title"], program.get("category"), program.get("program_type"),
+                    program.get("department"), program.get("description"),
+                    program.get("apply_start"), program.get("apply_end"),
+                    program.get("edu_start"), program.get("edu_end"),
+                    program.get("target"), program.get("competency"),
+                    program.get("method"), program.get("mileage", 0),
+                    program.get("capacity", 0), program.get("applicants", 0),
+                    program.get("status"), program.get("detail_url"), now, program_hash,
+                ),
+            )
         await self._conn.commit()
-        return cursor.lastrowid
+        return is_new
 
     async def get_programs(self, status: str = None, category: str = None,
                            limit: int = 20, offset: int = 0):
@@ -134,7 +158,7 @@ class Database:
     async def get_new_unnotified_programs(self, user_id: int):
         cursor = await self._conn.execute(
             """SELECT p.* FROM programs p
-               WHERE p.status = '모집중'
+               WHERE p.status IN ('모집중', '분반모집')
                AND p.id NOT IN (
                    SELECT program_id FROM notifications WHERE user_id = ?
                )
@@ -256,7 +280,11 @@ class Database:
             params.extend([f"%{kw}%" for kw in keywords])
 
         where = " OR ".join(conditions)
-        query = f"SELECT * FROM programs WHERE status = '모집중' AND ({where}) ORDER BY scraped_at DESC LIMIT ?"
+        query = (
+            "SELECT * FROM programs "
+            "WHERE status IN ('모집중', '분반모집') "
+            f"AND ({where}) ORDER BY scraped_at DESC LIMIT ?"
+        )
         params.append(limit)
 
         cursor = await self._conn.execute(query, params)

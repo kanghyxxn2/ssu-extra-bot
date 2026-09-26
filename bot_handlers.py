@@ -90,10 +90,13 @@ def setup_bot(bot: commands.Bot, db: Database, scraper: SsuScraper, notifier: No
         await interaction.response.send_message("🔄 프로그램 목록을 업데이트 중...", ephemeral=True)
         count = await scraper.scrape_and_store(db)
         await interaction.edit_original_response(
-            content=f"✅ 업데이트 완료! {count}개 프로그램이 업데이트되었습니다.\n`/프로그램`으로 확인하세요."
+            content=(
+                f"✅ 업데이트 완료! 신규 프로그램 {count}개를 발견했습니다.\n"
+                "`/프로그램`으로 확인하세요."
+            )
         )
 
-    @app_commands.command(name="키워드추가", description="관심 키워드를 추가합니다 (예: AI, 데이터)")
+    @bot.tree.command(name="키워드추가", description="관심 키워드를 추가합니다 (예: AI, 데이터)")
     @app_commands.describe(keyword="추가할 키워드")
     async def cmd_keyword_add(interaction: discord.Interaction, keyword: str):
         user_row = await db.add_user(interaction.user.id, interaction.user.name)
@@ -104,15 +107,15 @@ def setup_bot(bot: commands.Bot, db: Database, scraper: SsuScraper, notifier: No
             f"✅ 키워드 추가: **{keyword}**\n\n현재 키워드: {kw_text}", ephemeral=True,
         )
 
-    @app_commands.command(name="키워드삭제", description="키워드를 삭제합니다")
+    @bot.tree.command(name="키워드삭제", description="키워드를 삭제합니다")
     @app_commands.describe(keyword="삭제할 키워드")
     async def cmd_keyword_remove(interaction: discord.Interaction, keyword: str):
         user_row = await db.get_user(interaction.user.id)
         if not user_row:
             await interaction.response.send_message("먼저 `/카테고리`로 시작해주세요.", ephemeral=True)
             return
-        await db.remove_user_keyword(user_row, keyword.strip())
-        keywords = await db.get_user_keywords(user_row)
+        await db.remove_user_keyword(user_row["id"], keyword.strip())
+        keywords = await db.get_user_keywords(user_row["id"])
         kw_text = ", ".join(f"`{k}`" for k in keywords) if keywords else "(없음)"
         await interaction.response.send_message(
             f"🗑 키워드 삭제: **{keyword}**\n\n현재 키워드: {kw_text}", ephemeral=True,
@@ -168,6 +171,7 @@ class CategorySelect(discord.ui.Select):
         super().__init__(
             placeholder="관심 분야를 선택하세요...",
             options=options,
+            min_values=0,
             max_values=len(categories),
         )
         self._categories = categories

@@ -9,6 +9,8 @@ from bs4 import BeautifulSoup, Tag
 
 from config import (
     SSU_JOB_LIST_URL,
+    SSU_JOB_DETAIL_URL,
+    SSU_JOB_CATEGORY_CODES,
     SSU_PATH_BASE_URL,
     SSU_PATH_LOGIN_URL,
     SSU_PATH_INDEX_URL,
@@ -57,23 +59,35 @@ class SsuScraper:
 
     async def _scrape_job_center(self) -> list[dict]:
         programs = []
-        page = 1
-        while True:
-            page_programs = await self._scrape_job_page(page)
-            if not page_programs:
-                break
-            programs.extend(page_programs)
-            if len(page_programs) < _PER_PAGE:
-                break
-            page += 1
+        for category_code, category in SSU_JOB_CATEGORY_CODES.items():
+            page = 1
+            while True:
+                page_programs = await self._scrape_job_page(
+                    page, category_code=category_code, category=category,
+                )
+                if not page_programs:
+                    break
+                programs.extend(page_programs)
+                if len(page_programs) < _PER_PAGE:
+                    break
+                page += 1
         return programs
 
-    async def _scrape_job_page(self, page: int = 1) -> list[dict]:
-        data = {"currentPageNo": str(page), "year": str(datetime.now().year)}
+    async def _scrape_job_page(
+        self, page: int = 1, category_code: str = "0000", category: str = "기타",
+    ) -> list[dict]:
+        data = {
+            "currentPageNo": str(page),
+            "operYySh": str(datetime.now().year),
+            "prgmClsCdSh": category_code,
+        }
         try:
             response = await self.client.post(SSU_JOB_LIST_URL, data=data)
             response.raise_for_status()
-            return self._parse_job_programs(response.text)
+            programs = self._parse_job_programs(response.text)
+            for program in programs:
+                program["category"] = category
+            return programs
         except Exception as e:
             logger.error(f"Error scraping job center page {page}: {e}")
             return []
@@ -102,6 +116,10 @@ class SsuScraper:
         status_el = card.select_one("div.label_box span")
         if status_el:
             status = status_el.get_text(strip=True)
+        elif card.parent:
+            status_el = card.parent.select_one("div.img_wrap span")
+            if status_el:
+                status = status_el.get_text(strip=True)
 
         major_items = card.select("ul.major_type li")
         department = major_items[0].get_text(strip=True) if len(major_items) > 0 else ""
@@ -138,15 +156,13 @@ class SsuScraper:
                 params = json.loads(params_raw)
                 enc_seq = params.get("encSddpbSeq", "")
                 if enc_seq:
-                    detail_url = (
-                        "https://job.ssu.ac.kr/service/careerProgram/"
-                        f"careerProgramView.do?encSddpbSeq={enc_seq}"
-                    )
+                    detail_url = f"{SSU_JOB_DETAIL_URL}?encSddpbSeq={enc_seq}"
             except json.JSONDecodeError:
                 pass
 
         return {
             "title": title,
+            "category": self._infer_category(title, description),
             "status": status,
             "department": department,
             "program_type": program_type,
@@ -159,6 +175,25 @@ class SsuScraper:
             "competency": competency,
             "detail_url": detail_url,
         }
+
+    @staticmethod
+    def _infer_category(title: str, description: str = "") -> str:
+        text = f"{title} {description}".lower()
+        category_keywords = (
+            ("공공인재양성반", ("공공인재",)),
+            ("채용설명회/채용상담", ("채용설명회", "채용상담", "잡페어", "채용박람회")),
+            ("서포터즈/홍보대사", ("서포터즈", "홍보대사")),
+            ("공모전/경진대회", ("공모전", "경진대회", "해커톤")),
+            ("소모임/동아리", ("소모임", "동아리")),
+            ("전공탐색프로그램", ("전공탐색", "전공 탐색")),
+            ("상담/멘토링/코칭", ("상담", "멘토링", "멘토-멘티", "코칭", "클리닉")),
+            ("특강/워크숍", ("특강", "워크숍", "세미나", "캠프", "아카데미")),
+            ("진로탐색프로그램", ("진로탐색", "진로 탐색", "직무탐색", "직무 탐색")),
+        )
+        for category, keywords in category_keywords:
+            if any(keyword in text for keyword in keywords):
+                return category
+        return "기타"
 
     async def _scrape_ssu_path(self) -> list[dict]:
         if not SSU_ID or not SSU_PASSWORD:
@@ -277,6 +312,7 @@ class SsuScraper:
 
         return {
             "title": title,
+            "category": self._infer_category(title, description),
             "status": status,
             "department": "숭실대학교",
             "program_type": "비교과",
@@ -300,9 +336,12 @@ class SsuScraper:
 
         new_count = 0
         for program in programs:
-            result = await db.upsert_program(program)
-            if result:
+            is_new = await db.upsert_program(program)
+            if is_new:
                 new_count += 1
 
-        logger.info(f"Stored {new_count} new/updated programs")
+        logger.info(
+            "Stored %s new programs and updated %s existing programs",
+            new_count, len(programs) - new_count,
+        )
         return new_count
