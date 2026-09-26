@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER UNIQUE NOT NULL,
     username TEXT,
     notifications_enabled INTEGER DEFAULT 1,
+    onboarding_completed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -58,6 +59,12 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at TEXT NOT NULL,
     UNIQUE(user_id, program_id)
 );
+
+CREATE TABLE IF NOT EXISTS app_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -70,8 +77,21 @@ class Database:
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_SCHEMA)
+        await self._migrate_schema()
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.commit()
+
+    async def _migrate_schema(self):
+        cursor = await self._conn.execute("PRAGMA table_info(users)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        if "onboarding_completed_at" not in columns:
+            now = datetime.now().isoformat()
+            await self._conn.execute(
+                "ALTER TABLE users ADD COLUMN onboarding_completed_at TEXT"
+            )
+            await self._conn.execute(
+                "UPDATE users SET onboarding_completed_at = ?", (now,)
+            )
 
     async def close(self):
         if self._conn:
@@ -155,15 +175,16 @@ class Database:
         cursor = await self._conn.execute(query, params)
         return await cursor.fetchall()
 
-    async def get_new_unnotified_programs(self, user_id: int):
+    async def get_new_unnotified_programs(self, user_id: int, since: str):
         cursor = await self._conn.execute(
             """SELECT p.* FROM programs p
                WHERE p.status IN ('모집중', '분반모집')
+               AND p.scraped_at > ?
                AND p.id NOT IN (
                    SELECT program_id FROM notifications WHERE user_id = ?
                )
                ORDER BY p.scraped_at DESC""",
-            (user_id,),
+            (since, user_id),
         )
         return await cursor.fetchall()
 
@@ -193,6 +214,17 @@ class Database:
             "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
         )
         return await cursor.fetchone()
+
+    async def complete_onboarding(self, user_id: int):
+        now = datetime.now().isoformat()
+        await self._conn.execute(
+            """UPDATE users
+               SET onboarding_completed_at = COALESCE(onboarding_completed_at, ?),
+                   updated_at = ?
+               WHERE id = ?""",
+            (now, now, user_id),
+        )
+        await self._conn.commit()
 
     async def set_user_categories(self, user_id: int, categories: list[str]):
         await self._conn.execute(
@@ -256,6 +288,24 @@ class Database:
         await self._conn.execute(
             "INSERT OR IGNORE INTO notifications (user_id, program_id, sent_at) VALUES (?, ?, ?)",
             (user_id, program_id, datetime.now().isoformat()),
+        )
+        await self._conn.commit()
+
+    async def get_state(self, key: str) -> Optional[str]:
+        cursor = await self._conn.execute(
+            "SELECT value FROM app_state WHERE key = ?", (key,)
+        )
+        row = await cursor.fetchone()
+        return row["value"] if row else None
+
+    async def set_state(self, key: str, value: str):
+        now = datetime.now().isoformat()
+        await self._conn.execute(
+            """INSERT INTO app_state (key, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value, updated_at = excluded.updated_at""",
+            (key, value, now),
         )
         await self._conn.commit()
 

@@ -40,6 +40,7 @@ class SsuScraper:
             timeout=30.0, headers=_HEADERS, follow_redirects=True,
         )
         self._http_client: httpx.AsyncClient | None = None
+        self._scrape_lock = asyncio.Lock()
 
     async def close(self):
         await self.client.aclose()
@@ -330,18 +331,19 @@ class SsuScraper:
         return value.strip(), ""
 
     async def scrape_and_store(self, db) -> int:
-        logger.info("Starting scrape...")
-        programs = await self.scrape_all()
-        logger.info(f"Scraped {len(programs)} programs")
+        async with self._scrape_lock:
+            logger.info("Starting scrape...")
+            programs = await self.scrape_all()
+            logger.info(f"Scraped {len(programs)} programs")
 
-        new_count = 0
-        for program in programs:
-            is_new = await db.upsert_program(program)
-            if is_new:
-                new_count += 1
+            new_count = 0
+            for program in programs:
+                is_new = await db.upsert_program(program)
+                if is_new:
+                    new_count += 1
 
-        logger.info(
-            "Stored %s new programs and updated %s existing programs",
-            new_count, len(programs) - new_count,
-        )
-        return new_count
+            logger.info(
+                "Stored %s new programs and updated %s existing programs",
+                new_count, len(programs) - new_count,
+            )
+            return new_count

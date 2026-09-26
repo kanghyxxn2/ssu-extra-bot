@@ -1,4 +1,7 @@
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 
 from database import Database
 
@@ -74,3 +77,69 @@ class DatabaseTest(unittest.IsolatedAsyncioTestCase):
         await self.db.remove_user_keyword(user_id, "AI")
 
         self.assertEqual(await self.db.get_user_keywords(user_id), [])
+
+    async def test_notifications_only_include_programs_after_onboarding(self):
+        await self.db.upsert_program({
+            "title": "기존 특강",
+            "category": "특강/워크숍",
+            "status": "모집중",
+            "detail_url": "https://example.com/program/old",
+        })
+        user_id = await self.db.add_user(9999, "new-user")
+        await self.db.set_user_categories(user_id, ["특강/워크숍"])
+        await self.db.complete_onboarding(user_id)
+        user = await self.db.get_user(9999)
+        await self.db.upsert_program({
+            "title": "신규 특강",
+            "category": "특강/워크숍",
+            "status": "모집중",
+            "detail_url": "https://example.com/program/new",
+        })
+
+        programs = await self.db.get_new_unnotified_programs(
+            user_id, user["onboarding_completed_at"],
+        )
+
+        self.assertEqual([row["title"] for row in programs], ["신규 특강"])
+
+    async def test_complete_onboarding_keeps_original_timestamp(self):
+        user_id = await self.db.add_user(1010, "tester")
+        await self.db.complete_onboarding(user_id)
+        first = (await self.db.get_user(1010))["onboarding_completed_at"]
+
+        await self.db.complete_onboarding(user_id)
+        second = (await self.db.get_user(1010))["onboarding_completed_at"]
+
+        self.assertEqual(first, second)
+
+
+class DatabaseMigrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_users_are_baselined_during_onboarding_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "legacy.db"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                """CREATE TABLE users (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       telegram_id INTEGER UNIQUE NOT NULL,
+                       username TEXT,
+                       notifications_enabled INTEGER DEFAULT 1,
+                       created_at TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                   )"""
+            )
+            connection.execute(
+                """INSERT INTO users
+                       (telegram_id, username, created_at, updated_at)
+                   VALUES (1, 'legacy-user', '2026-01-01', '2026-01-01')"""
+            )
+            connection.commit()
+            connection.close()
+
+            db = Database(str(db_path))
+            await db.init()
+            try:
+                user = await db.get_user(1)
+                self.assertIsNotNone(user["onboarding_completed_at"])
+            finally:
+                await db.close()

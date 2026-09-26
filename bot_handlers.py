@@ -9,6 +9,16 @@ from notifier import Notifier
 
 
 def setup_bot(bot: commands.Bot, db: Database, scraper: SsuScraper, notifier: Notifier):
+    async def send_onboarding(interaction: discord.Interaction):
+        user_id = await db.add_user(interaction.user.id, interaction.user.name)
+        selected = await db.get_user_categories(user_id)
+        view = CategorySelectView(db, user_id, selected)
+        await interaction.response.send_message(
+            "관심 있는 분야를 선택하고 완료를 눌러 온보딩을 마쳐주세요:",
+            view=view,
+            ephemeral=True,
+        )
+
     @bot.event
     async def on_message(message: discord.Message):
         if message.author.bot:
@@ -19,13 +29,11 @@ def setup_bot(bot: commands.Bot, db: Database, scraper: SsuScraper, notifier: No
 
     @bot.tree.command(name="카테고리", description="관심 비교과 분야를 설정합니다")
     async def cmd_categories(interaction: discord.Interaction):
-        user_row = await db.add_user(interaction.user.id, interaction.user.name)
-        selected = await db.get_user_categories(user_row)
-        view = CategorySelectView(db, user_row, selected)
-        await interaction.response.send_message(
-            "관심 있는 분야를 선택하세요 (여러 개 선택 가능):",
-            view=view, ephemeral=True,
-        )
+        await send_onboarding(interaction)
+
+    @bot.tree.command(name="온보딩", description="관심사를 설정하고 알림을 시작합니다")
+    async def cmd_onboarding(interaction: discord.Interaction):
+        await send_onboarding(interaction)
 
     @bot.tree.command(name="설정", description="현재 카테고리/키워드/알림 설정을 확인합니다")
     async def cmd_settings(interaction: discord.Interaction):
@@ -37,6 +45,7 @@ def setup_bot(bot: commands.Bot, db: Database, scraper: SsuScraper, notifier: No
         categories = await db.get_user_categories(user_row["id"])
         keywords = await db.get_user_keywords(user_row["id"])
         notif = "🔔 켜짐" if user_row["notifications_enabled"] else "🔕 꺼짐"
+        onboarding = "✅ 완료" if user_row["onboarding_completed_at"] else "⏳ 미완료"
 
         cat_lines = "\n".join(
             f"  {CATEGORY_EMOJI.get(c, '📌')} {c}" for c in categories
@@ -48,6 +57,7 @@ def setup_bot(bot: commands.Bot, db: Database, scraper: SsuScraper, notifier: No
         embed.add_field(name="📂 관심 카테고리", value=cat_lines, inline=False)
         embed.add_field(name="🔑 키워드", value=kw_text, inline=False)
         embed.add_field(name="🔔 알림", value=notif, inline=False)
+        embed.add_field(name="🎯 온보딩", value=onboarding, inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @bot.tree.command(name="알림", description="알림을 켜거나 끕니다")
@@ -99,8 +109,14 @@ def setup_bot(bot: commands.Bot, db: Database, scraper: SsuScraper, notifier: No
     @bot.tree.command(name="키워드추가", description="관심 키워드를 추가합니다 (예: AI, 데이터)")
     @app_commands.describe(keyword="추가할 키워드")
     async def cmd_keyword_add(interaction: discord.Interaction, keyword: str):
+        keyword = keyword.strip()
+        if not keyword:
+            await interaction.response.send_message(
+                "키워드는 한 글자 이상 입력해주세요.", ephemeral=True,
+            )
+            return
         user_row = await db.add_user(interaction.user.id, interaction.user.name)
-        await db.add_user_keyword(user_row, keyword.strip())
+        await db.add_user_keyword(user_row, keyword)
         keywords = await db.get_user_keywords(user_row)
         kw_text = ", ".join(f"`{k}`" for k in keywords)
         await interaction.response.send_message(
@@ -128,7 +144,8 @@ async def _cmd_start(message: discord.Message, db: Database):
         title="👋 숭실대 비교과 알리미",
         description=(
             "관심 있는 비교과 프로그램만 골라서 알려드려요!\n\n"
-            "🎯 `/카테고리` — 관심 분야 설정\n"
+            "🎯 `/온보딩` — 관심 분야 설정 및 알림 시작\n"
+            "📂 `/카테고리` — 관심 분야 변경\n"
             "🔑 `/키워드추가 [단어]` — 키워드 추가\n"
             "🗑 `/키워드삭제 [단어]` — 키워드 삭제\n"
             "📋 `/프로그램` — 맞춤 프로그램 보기\n"
@@ -150,9 +167,19 @@ class CategorySelectView(discord.ui.View):
     @discord.ui.button(label="✅ 완료", style=discord.ButtonStyle.green)
     async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         categories = await self.db.get_user_categories(self.user_id)
+        if not categories:
+            await interaction.response.edit_message(
+                content="관심 분야를 하나 이상 선택한 뒤 완료를 눌러주세요.",
+                view=self,
+            )
+            return
+        await self.db.complete_onboarding(self.user_id)
         cat_text = ", ".join(f"{CATEGORY_EMOJI.get(c, '📌')} {c}" for c in categories) if categories else "(없음)"
         await interaction.response.edit_message(
-            content=f"✅ 카테고리 설정이 저장되었습니다!\n{cat_text}\n`/프로그램`으로 맞춤 프로그램을 확인하세요.",
+            content=(
+                "✅ 온보딩이 완료되었습니다! 앞으로 새로 등록되는 맞춤 프로그램을 알려드릴게요.\n"
+                f"{cat_text}\n`/프로그램`으로 현재 프로그램도 확인할 수 있습니다."
+            ),
             view=None,
         )
 

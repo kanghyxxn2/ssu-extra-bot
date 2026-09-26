@@ -16,3 +16,4 @@ class BotCommandTest(unittest.TestCase):
 
         self.assertIn("키워드추가", command_names)
         self.assertIn("키워드삭제", command_names)
+        self.assertIn("온보딩", command_names)

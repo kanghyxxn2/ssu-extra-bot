@@ -26,13 +26,19 @@ class Notifier:
     async def _notify_user(self, user):
         user_id = user["id"]
         discord_id = user["telegram_id"]
+        onboarding_completed_at = user["onboarding_completed_at"]
+
+        if not onboarding_completed_at:
+            return
 
         categories = await self.db.get_user_categories(user_id)
         keywords = await self.db.get_user_keywords(user_id)
         if not categories and not keywords:
             return
 
-        programs = await self.db.get_new_unnotified_programs(user_id)
+        programs = await self.db.get_new_unnotified_programs(
+            user_id, onboarding_completed_at,
+        )
         matching = [p for p in programs if self._matches(p, categories, keywords)]
 
         for program in matching[:5]:
@@ -52,7 +58,11 @@ class Notifier:
     @staticmethod
     def _matches(program, categories: list[str], keywords: list[str]) -> bool:
         cat_match = program["category"] in categories if categories else False
-        kw_match = any(kw in program["title"] for kw in keywords) if keywords else False
+        title = program["title"].casefold()
+        kw_match = (
+            any(keyword.casefold() in title for keyword in keywords)
+            if keywords else False
+        )
         return cat_match or kw_match
 
     @staticmethod
